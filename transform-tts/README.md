@@ -20,6 +20,7 @@
     - getInstance 只实例化一次
     - 懒执行
     - Promise.all + nlp 流程的理解 (tokenizer、 model、 vscoder)
+    
 
 - audio 标签的url <- Object.createObjectURL(blob)
     input_ids(tokenizer 分词) + speaking——embeddings + vocoder (合成器) <- tokenizer + speaking
