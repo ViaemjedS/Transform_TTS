@@ -1,0 +1,5 @@
+# 模型文件（通过脚本下载）
+transform-tts/public/models/
+
+# 依赖
+node_modules/

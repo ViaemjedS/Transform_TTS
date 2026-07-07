@@ -12,8 +12,12 @@ import {
 } from './utils'
 
 // 配置 Transformers.js 运行环境
-// 禁用本地模型加载，强制从 HuggingFace Hub 远程下载模型文件
-env.allowLocalModels = false;
+// 启用本地模型模式：从 public/models/ 目录加载，完全离线，无需网络请求
+env.allowLocalModels = true;
+// 指定本地模型存放路径（Vite 开发服务器将 public/ 目录作为静态资源根路径）
+env.localModelPath = '/models/';
+// 启用浏览器本地缓存，已下载的模型文件无需重复加载
+env.useBrowserCache = true;
 
 // ============================================================
 // 文本转语音流水线类（单例模式）
@@ -23,9 +27,9 @@ env.allowLocalModels = false;
 // 2. 采用单例模式确保整个 Web Worker 生命周期内只创建一次模型实例
 // 3. 所有 TTS 请求复用同一个分词器、模型、声码器实例
 class MyTextToSpeechPipeline {
-    // 说话人嵌入向量的远程数据源根地址（HuggingFace 数据集）
+    // 说话人嵌入向量的本地数据路径（public/models/speakers/ 目录下）
     // 每个说话人的 .bin 文件包含一个 1×512 维的特征向量，用于控制合成语音的音色
-    static BASE_URL = 'https://huggingface.co/datasets/Xenova/cmu-arctic-xvectors-extracted/resolve/main/';
+    static BASE_URL = '/models/speakers/';
     // SpeechT5 TTS 模型的 HuggingFace ID（文本 → 语音特征）
     static model_id = 'Xenova/speecht5_tts'
     // HiFi-GAN 声码器的 HuggingFace ID（语音特征 → 真实音频波形）
@@ -43,13 +47,13 @@ class MyTextToSpeechPipeline {
         // 如果分词器尚未实例化，则先从 HuggingFace 加载
         if (this.tokenizer_instance === null) {
             // 使用 AutoTokenizer 根据 model_id 自动选择并加载预训练的分词器
-            this.tokenizer = AutoTokenizer.from_pretrained(this.model_id, {
+            this.tokenizer_instance = AutoTokenizer.from_pretrained(this.model_id, {
                 progress_callback  // 传入进度回调，实时报告下载进度
             })
         }
 
-        // 如果 TTS 模型尚未实例化，则加载模型和声码器
-        if (this.model_instance===null) {
+        // 如果 TTS 模型尚未实例化，则加载模型
+        if (this.model_instance === null) {
             // 加载 SpeechT5 文本转语音模型（从 HuggingFace 远程下载）
             this.model_instance = SpeechT5ForTextToSpeech.from_pretrained(
                 this.model_id,           // 模型 ID
@@ -58,33 +62,34 @@ class MyTextToSpeechPipeline {
                     progress_callback    // 下载进度回调
                 }
             )
-            // 加载 HiFi-GAN 声码器（将频谱特征转为音频波形）
-            if (this.vocoder_instance === null) {
-                this.vocoder_instance = SpeechT5HifiGan.from_pretrained(
-                    this.vocoder_id,      // 声码器模型 ID
-                    {
-                        dtype: 'fp32',    // 使用 32 位浮点精度
-                        progress_callback // 下载进度回调
-                    }
-                )
-            }
-
-            // 返回一个 Promise，等待所有三个组件（分词器、模型、声码器）加载完成后 resolve
-            return new Promise(async (resolve, reject) => {
-                // 使用 Promise.all 并行等待所有异步加载任务完成
-                const result = await Promise.all([
-                    this.tokenizer,        // 等待分词器加载
-                    this.model_instance,   // 等待 TTS 模型加载
-                    this.vocoder_instance  // 等待声码器加载
-                ])
-                // 所有模型加载完成后，通过 postMessage 通知主线程"准备就绪"
-                self.postMessage({
-                    status: 'ready'  // 状态标记：模型已就绪
-                });
-                // resolve 返回加载结果数组
-                resolve(result);
-            })
         }
+        // 如果声码器尚未实例化，则加载声码器（独立判断，与 model_instance 解耦）
+        if (this.vocoder_instance === null) {
+            // 加载 HiFi-GAN 声码器（将频谱特征转为音频波形）
+            this.vocoder_instance = SpeechT5HifiGan.from_pretrained(
+                this.vocoder_id,      // 声码器模型 ID
+                {
+                    dtype: 'fp32',    // 使用 32 位浮点精度
+                    progress_callback // 下载进度回调
+                }
+            )
+        }
+
+        // 等待所有三个组件（分词器、模型、声码器）加载完成
+        const result = await Promise.all([
+            this.tokenizer_instance,   // 等待分词器加载
+            this.model_instance,       // 等待 TTS 模型加载
+            this.vocoder_instance      // 等待声码器加载
+        ])
+        // 仅首次加载完成后通知主线程"准备就绪"（避免重复发送 ready 消息）
+        if (!this._ready_sent) {
+            this._ready_sent = true;
+            self.postMessage({
+                status: 'ready'  // 状态标记：模型已就绪
+            });
+        }
+        // 返回加载结果数组
+        return result;
     }
 
     // 获取指定说话人的嵌入向量（静态异步方法）
@@ -117,8 +122,12 @@ self.onmessage = async (e) => {
     // 懒加载模式：首次收到消息时才触发 AI 模型的初始化和下载
     // 解构获取分词器、TTS 模型、声码器三个核心组件
     const [tokenizer, model, vocoder] = await MyTextToSpeechPipeline.getInstance(x => {
+        // @xenova/transformers 返回的 progress 是 0~1 的小数，需乘以 100 转为百分比
         // 将下载进度信息转发给主线程，用于显示进度条
-        self.postMessage(x)
+        self.postMessage({
+            ...x,
+            progress: x.progress !== undefined ? x.progress * 100 : undefined
+        })
     })
 
     // 使用分词器将输入文本转换为 token ID 数组
